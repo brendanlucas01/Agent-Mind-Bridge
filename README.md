@@ -23,8 +23,8 @@ Agents can read and write to the same projects, threads, memory, and skills acro
 
 ```bash
 # 1. Clone and install
-git clone <repo-url>
-cd mcp_communicator
+git clone https://github.com/brendanlucas01/Agent-Mind-Bridge.git
+cd Agent-Mind-Bridge
 pip install -r requirements.txt
 
 # 2. Configure (optional)

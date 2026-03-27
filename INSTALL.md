@@ -15,8 +15,8 @@ python --version
 ## Step 1 — Clone the Repository
 
 ```bash
-git clone <repo-url>
-cd mcp_communicator
+git clone https://github.com/brendanlucas01/Agent-Mind-Bridge.git
+cd Agent-Mind-Bridge
 ```
 
 ---
