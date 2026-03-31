@@ -13,7 +13,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-from db import init_db, init_db_v2
+from db import init_db, init_db_v2, init_db_v3, init_db_v4
 
 load_dotenv(Path(__file__).parent / ".env", override=True)
 
@@ -42,6 +42,8 @@ async def lifespan(server):
     conn.execute("PRAGMA foreign_keys=ON")
     init_db(conn)
     init_db_v2(conn)
+    init_db_v3(conn)
+    init_db_v4(conn)
 
     yield {"db": conn}
 

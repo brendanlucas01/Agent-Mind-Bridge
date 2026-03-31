@@ -1,0 +1,69 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f8f9fa;
+  --foreground: #1e293b;
+  
+  /* Windows 7 Aesthetic variables */
+  --color-working: #22c55e;
+  --color-idle: #6b7280;
+  --color-blocked: #ef4444;
+  --color-reviewing: #f59e0b;
+  --color-critical: #dc2626;
+  --color-high: #f97316;
+  --color-medium: #3b82f6;
+  --color-low: #9ca3af;
+  
+  --shadow-card: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.08);
+  --shadow-drawer: -4px 0 24px rgba(0,0,0,0.15);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+}
+
+/* Base style resets and body */
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Glassmorphism for cards */
+.win7-glass {
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+}
+
+/* Animations from UPGRADE_V4.md */
+@keyframes pulse-working {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(1.1); }
+}
+
+.status-working {
+  animation: pulse-working 2s ease-in-out infinite;
+}
+
+/* Custom scrollbar for Windows 7 feel */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 5px;
+  border: 2px solid #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}

@@ -1843,3 +1843,452 @@ def search_threads_fts(conn, query: str, project_id: str | None, limit: int, off
         sql += " LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+# =============================================================================
+# V3 SCHEMA — Sprint Board
+# =============================================================================
+
+def init_db_v3(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sprints (
+            id          TEXT PRIMARY KEY,
+            project_id  TEXT NOT NULL REFERENCES projects(id),
+            name        TEXT NOT NULL,
+            goal        TEXT,
+            status      TEXT NOT NULL DEFAULT 'planned',
+            start_date  TEXT,
+            end_date    TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS tasks (
+            id             TEXT PRIMARY KEY,
+            project_id     TEXT NOT NULL REFERENCES projects(id),
+            sprint_id      TEXT REFERENCES sprints(id),
+            title          TEXT NOT NULL,
+            description    TEXT,
+            status         TEXT NOT NULL DEFAULT 'backlog',
+            assigned_to    TEXT REFERENCES agents(id),
+            created_by     TEXT NOT NULL REFERENCES agents(id),
+            priority       TEXT NOT NULL DEFAULT 'medium',
+            blocked_reason TEXT,
+            thread_id      TEXT REFERENCES threads(id),
+            due_date       TEXT,
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tasks_project   ON tasks(project_id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_sprint    ON tasks(sprint_id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_assigned  ON tasks(assigned_to);
+        CREATE INDEX IF NOT EXISTS idx_tasks_status    ON tasks(project_id, status);
+        CREATE INDEX IF NOT EXISTS idx_sprints_project ON sprints(project_id);
+        CREATE INDEX IF NOT EXISTS idx_sprints_status  ON sprints(project_id, status);
+    """)
+    conn.commit()
+
+
+# --- Sprint queries ---
+
+def db_sprint_get_by_id(conn, sprint_id: str) -> dict | None:
+    row = conn.execute("SELECT * FROM sprints WHERE id = ?", (sprint_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def db_sprint_get_active(conn, project_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM sprints WHERE project_id = ? AND status = 'active'",
+        (project_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def db_sprint_demote_active(conn, project_id: str, exclude_id: str, now: str) -> None:
+    """Demote any currently active sprint in this project to 'planned', except exclude_id."""
+    conn.execute(
+        "UPDATE sprints SET status = 'planned', updated_at = ? WHERE project_id = ? AND status = 'active' AND id != ?",
+        (now, project_id, exclude_id)
+    )
+
+
+def db_sprint_create(conn, id: str, project_id: str, name: str, goal: str | None,
+                     status: str, start_date: str | None, end_date: str | None,
+                     created_at: str) -> dict:
+    conn.execute(
+        """INSERT INTO sprints (id, project_id, name, goal, status, start_date, end_date, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (id, project_id, name, goal, status, start_date, end_date, created_at, created_at)
+    )
+    conn.commit()
+    return db_sprint_get_by_id(conn, id)
+
+
+def db_sprint_list(conn, project_id: str, status: str | None, limit: int, offset: int) -> tuple[list[dict], int]:
+    conditions = ["s.project_id = ?"]
+    params: list = [project_id]
+    if status:
+        conditions.append("s.status = ?")
+        params.append(status)
+    where = "WHERE " + " AND ".join(conditions)
+
+    total = conn.execute(f"SELECT COUNT(*) FROM sprints s {where}", params).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT * FROM sprints s {where} ORDER BY s.created_at DESC LIMIT ? OFFSET ?",
+        params + [limit, offset]
+    ).fetchall()
+
+    result = []
+    for row in rows:
+        sprint = dict(row)
+        counts = conn.execute(
+            "SELECT status, COUNT(*) as cnt FROM tasks WHERE sprint_id = ? GROUP BY status",
+            (sprint["id"],)
+        ).fetchall()
+        task_counts = {"backlog": 0, "todo": 0, "in_progress": 0, "blocked": 0, "review": 0, "done": 0}
+        for c in counts:
+            if c["status"] in task_counts:
+                task_counts[c["status"]] = c["cnt"]
+        task_counts["total"] = sum(v for k, v in task_counts.items() if k != "total")
+        sprint["task_counts"] = task_counts
+        result.append(sprint)
+
+    return result, total
+
+
+def db_sprint_update(conn, sprint_id: str, fields: dict, now: str) -> dict | None:
+    if not fields:
+        return db_sprint_get_by_id(conn, sprint_id)
+    set_parts = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [now, sprint_id]
+    conn.execute(f"UPDATE sprints SET {set_parts}, updated_at = ? WHERE id = ?", values)
+    conn.commit()
+    return db_sprint_get_by_id(conn, sprint_id)
+
+
+_TASK_BOARD_ORDER = """
+    ORDER BY CASE t.status
+        WHEN 'blocked'     THEN 1
+        WHEN 'in_progress' THEN 2
+        WHEN 'review'      THEN 3
+        WHEN 'todo'        THEN 4
+        WHEN 'backlog'     THEN 5
+        WHEN 'done'        THEN 6
+        ELSE 7
+    END,
+    CASE t.priority
+        WHEN 'critical' THEN 1
+        WHEN 'high'     THEN 2
+        WHEN 'medium'   THEN 3
+        ELSE 4
+    END
+"""
+
+_TASK_JOIN_COLS = """
+    SELECT t.*,
+           a1.name AS assigned_to_name,
+           a2.name AS created_by_name
+    FROM tasks t
+    LEFT JOIN agents a1 ON t.assigned_to = a1.id
+    LEFT JOIN agents a2 ON t.created_by  = a2.id
+"""
+
+
+def db_sprint_board_tasks(conn, sprint_id: str) -> list[dict]:
+    rows = conn.execute(
+        f"{_TASK_JOIN_COLS} WHERE t.sprint_id = ? {_TASK_BOARD_ORDER}",
+        (sprint_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def db_backlog_tasks(conn, project_id: str) -> list[dict]:
+    rows = conn.execute(
+        f"{_TASK_JOIN_COLS} WHERE t.project_id = ? AND t.sprint_id IS NULL {_TASK_BOARD_ORDER}",
+        (project_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# --- Task queries ---
+
+def db_task_get_by_id(conn, task_id: str) -> dict | None:
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def db_task_get_full(conn, task_id: str) -> dict | None:
+    row = conn.execute(
+        """SELECT t.*,
+                  a1.name  AS assigned_to_name,
+                  a2.name  AS created_by_name,
+                  s.name   AS sprint_name,
+                  p.name   AS project_name,
+                  th.title AS thread_title
+           FROM tasks t
+           LEFT JOIN agents  a1 ON t.assigned_to = a1.id
+           LEFT JOIN agents  a2 ON t.created_by  = a2.id
+           LEFT JOIN sprints s  ON t.sprint_id   = s.id
+           LEFT JOIN projects p ON t.project_id  = p.id
+           LEFT JOIN threads th ON t.thread_id   = th.id
+           WHERE t.id = ?""",
+        (task_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def db_task_create(conn, id: str, project_id: str, sprint_id: str | None,
+                   title: str, description: str | None, status: str,
+                   assigned_to: str | None, created_by: str, priority: str,
+                   blocked_reason: str | None, thread_id: str | None,
+                   due_date: str | None, created_at: str) -> dict:
+    conn.execute(
+        """INSERT INTO tasks
+           (id, project_id, sprint_id, title, description, status,
+            assigned_to, created_by, priority, blocked_reason, thread_id, due_date,
+            created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (id, project_id, sprint_id, title, description, status,
+         assigned_to, created_by, priority, blocked_reason, thread_id, due_date,
+         created_at, created_at)
+    )
+    conn.commit()
+    return db_task_get_full(conn, id)
+
+
+def db_task_list(conn, project_id: str, sprint_id_filter: str | None,
+                 status: str | None, assigned_to: str | None, priority: str | None,
+                 limit: int, offset: int) -> tuple[list[dict], int]:
+    conditions = ["t.project_id = ?"]
+    params: list = [project_id]
+
+    if sprint_id_filter is not None:
+        if sprint_id_filter == "backlog":
+            conditions.append("t.sprint_id IS NULL")
+        else:
+            conditions.append("t.sprint_id = ?")
+            params.append(sprint_id_filter)
+
+    if status:
+        conditions.append("t.status = ?")
+        params.append(status)
+    if assigned_to:
+        conditions.append("t.assigned_to = ?")
+        params.append(assigned_to)
+    if priority:
+        conditions.append("t.priority = ?")
+        params.append(priority)
+
+    where = "WHERE " + " AND ".join(conditions)
+    total = conn.execute(f"SELECT COUNT(*) FROM tasks t {where}", params).fetchone()[0]
+
+    rows = conn.execute(
+        f"""SELECT t.id, t.title, t.status, t.priority, t.blocked_reason,
+                   t.sprint_id, t.due_date, t.created_at, t.updated_at,
+                   a1.name AS assigned_to_name,
+                   COALESCE(s.name, 'Backlog') AS sprint_name
+            FROM tasks t
+            LEFT JOIN agents  a1 ON t.assigned_to = a1.id
+            LEFT JOIN sprints s  ON t.sprint_id   = s.id
+            {where}
+            ORDER BY CASE t.priority
+                WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4
+            END ASC, t.created_at ASC
+            LIMIT ? OFFSET ?""",
+        params + [limit, offset]
+    ).fetchall()
+
+    return [dict(r) for r in rows], total
+
+
+def db_task_update(conn, task_id: str, fields: dict, now: str) -> dict | None:
+    if not fields:
+        return db_task_get_full(conn, task_id)
+    set_parts = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [now, task_id]
+    conn.execute(f"UPDATE tasks SET {set_parts}, updated_at = ? WHERE id = ?", values)
+    conn.commit()
+    return db_task_get_full(conn, task_id)
+
+
+def db_task_assign(conn, task_id: str, agent_id: str | None, now: str) -> None:
+    conn.execute(
+        "UPDATE tasks SET assigned_to = ?, updated_at = ? WHERE id = ?",
+        (agent_id, now, task_id)
+    )
+    conn.commit()
+
+
+def db_task_delete(conn, task_id: str) -> str | None:
+    """Returns the title of the deleted task, or None if not found."""
+    row = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if not row:
+        return None
+    title = row["title"]
+    conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    conn.commit()
+    return title
+
+
+def db_sprint_tasks_for_session(conn, agent_id: str, project_id: str) -> tuple[list[dict], str | None]:
+    """For context_session_start Option C.
+    Returns (tasks, sprint_name) if agent has assignments in the active sprint.
+    Returns ([], None) if no active sprint or no assigned tasks.
+    """
+    sprint = db_sprint_get_active(conn, project_id)
+    if not sprint:
+        return [], None
+    rows = conn.execute(
+        """SELECT t.id, t.title, t.status, t.priority, t.blocked_reason
+           FROM tasks t
+           WHERE t.sprint_id = ? AND t.assigned_to = ?
+           ORDER BY CASE t.status
+               WHEN 'blocked'     THEN 1
+               WHEN 'in_progress' THEN 2
+               WHEN 'review'      THEN 3
+               WHEN 'todo'        THEN 4
+               WHEN 'backlog'     THEN 5
+               WHEN 'done'        THEN 6
+               ELSE 7
+           END""",
+        (sprint["id"], agent_id)
+    ).fetchall()
+    return [dict(r) for r in rows], sprint["name"]
+
+
+# =============================================================================
+# V4 — Task Dependencies + Sprint Retrospective
+# =============================================================================
+
+def init_db_v4(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS task_dependencies (
+            id          TEXT PRIMARY KEY,
+            task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            depends_on  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            created_by  TEXT NOT NULL REFERENCES agents(id),
+            created_at  TEXT NOT NULL,
+            UNIQUE(task_id, depends_on)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_deps_task ON task_dependencies(task_id);
+        CREATE INDEX IF NOT EXISTS idx_deps_on   ON task_dependencies(depends_on);
+    """)
+    conn.commit()
+
+
+def would_create_cycle(conn, task_id: str, depends_on: str) -> bool:
+    """
+    Walk the dependency graph upward from depends_on.
+    If task_id is reachable, inserting this dependency would create a cycle.
+    Uses iterative BFS — never recurse in SQLite callbacks.
+    """
+    visited = set()
+    queue = [depends_on]
+    while queue:
+        current = queue.pop(0)
+        if current == task_id:
+            return True
+        if current in visited:
+            continue
+        visited.add(current)
+        rows = conn.execute(
+            "SELECT depends_on FROM task_dependencies WHERE task_id = ?",
+            (current,)
+        ).fetchall()
+        queue.extend(r[0] for r in rows)
+    return False
+
+
+def db_task_get_dependencies(conn, task_id: str) -> dict:
+    """
+    Returns {'blocks': [...], 'waiting_on': [...]} for a given task.
+    Each entry is {id, title, status}.
+    """
+    waiting_on = conn.execute(
+        """SELECT t.id, t.title, t.status
+           FROM task_dependencies td
+           JOIN tasks t ON td.depends_on = t.id
+           WHERE td.task_id = ?""",
+        (task_id,)
+    ).fetchall()
+    blocks = conn.execute(
+        """SELECT t.id, t.title, t.status
+           FROM task_dependencies td
+           JOIN tasks t ON td.task_id = t.id
+           WHERE td.depends_on = ?""",
+        (task_id,)
+    ).fetchall()
+    return {
+        "waiting_on": [dict(r) for r in waiting_on],
+        "blocks":     [dict(r) for r in blocks],
+    }
+
+
+def db_task_add_dependency(conn, id: str, task_id: str, depends_on: str,
+                           created_by: str, created_at: str) -> None:
+    conn.execute(
+        "INSERT INTO task_dependencies (id, task_id, depends_on, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+        (id, task_id, depends_on, created_by, created_at)
+    )
+    conn.commit()
+
+
+def db_task_remove_dependency(conn, task_id: str, depends_on: str) -> bool:
+    """Returns True if a row was deleted, False if it didn't exist."""
+    cursor = conn.execute(
+        "DELETE FROM task_dependencies WHERE task_id = ? AND depends_on = ?",
+        (task_id, depends_on)
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def db_sprint_retro_data(conn, sprint_id: str) -> dict:
+    """
+    Gathers all data needed to generate a sprint retrospective.
+    Returns a dict with keys: sprint, project, tasks_by_status, agents, linked_threads.
+    """
+    sprint = db_sprint_get_by_id(conn, sprint_id)
+    if not sprint:
+        return {}
+
+    project = conn.execute("SELECT * FROM projects WHERE id = ?", (sprint["project_id"],)).fetchone()
+
+    tasks = conn.execute(
+        """SELECT t.*, a.name AS assigned_to_name
+           FROM tasks t
+           LEFT JOIN agents a ON t.assigned_to = a.id
+           WHERE t.sprint_id = ?""",
+        (sprint_id,)
+    ).fetchall()
+    tasks = [dict(r) for r in tasks]
+
+    tasks_by_status: dict[str, list] = {}
+    agent_ids: set = set()
+    thread_ids: set = set()
+    for t in tasks:
+        tasks_by_status.setdefault(t["status"], []).append(t)
+        if t.get("assigned_to"):
+            agent_ids.add(t["assigned_to"])
+        if t.get("thread_id"):
+            thread_ids.add(t["thread_id"])
+
+    agents = []
+    if agent_ids:
+        placeholders = ",".join("?" * len(agent_ids))
+        agents = conn.execute(
+            f"SELECT id, name FROM agents WHERE id IN ({placeholders})",
+            list(agent_ids)
+        ).fetchall()
+        agents = [dict(r) for r in agents]
+
+    return {
+        "sprint":          dict(sprint),
+        "project":         dict(project) if project else {},
+        "tasks_by_status": tasks_by_status,
+        "all_tasks":       tasks,
+        "agents":          agents,
+        "linked_threads":  list(thread_ids),
+    }

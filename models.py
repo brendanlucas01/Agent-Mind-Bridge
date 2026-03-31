@@ -640,3 +640,149 @@ class SearchContextInput(BaseModel):
     limit: int = Field(default=10, ge=1, le=50)
     offset: int = Field(default=0, ge=0)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+# =============================================================================
+# V3 Models — Sprint Board
+# =============================================================================
+
+class TaskStatus(str, Enum):
+    BACKLOG     = "backlog"
+    TODO        = "todo"
+    IN_PROGRESS = "in_progress"
+    BLOCKED     = "blocked"
+    REVIEW      = "review"
+    DONE        = "done"
+
+
+class TaskPriority(str, Enum):
+    LOW      = "low"
+    MEDIUM   = "medium"
+    HIGH     = "high"
+    CRITICAL = "critical"
+
+
+class SprintStatus(str, Enum):
+    PLANNED   = "planned"
+    ACTIVE    = "active"
+    COMPLETED = "completed"
+
+
+# --- Sprint Models ---
+
+class SprintCreateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    project_id:  str                  = Field(..., description="Project UUID this sprint belongs to")
+    name:        str                  = Field(..., description="Sprint name (e.g. 'Sprint 1', 'v3-release')", min_length=1, max_length=100)
+    goal:        Optional[str]        = Field(None, description="What this sprint aims to achieve", max_length=500)
+    status:      SprintStatus         = Field(default=SprintStatus.PLANNED, description="'planned' | 'active' | 'completed'. Setting 'active' demotes any current active sprint to 'planned'.")
+    start_date:  Optional[str]        = Field(None, description="Optional start date (ISO format: YYYY-MM-DD)")
+    end_date:    Optional[str]        = Field(None, description="Optional end date (ISO format: YYYY-MM-DD)")
+
+
+class SprintListInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    project_id:      str                    = Field(..., description="Project UUID")
+    status:          Optional[SprintStatus] = Field(None, description="Filter by status. Omit for all.")
+    limit:           int                    = Field(default=20, ge=1, le=100)
+    offset:          int                    = Field(default=0, ge=0)
+    response_format: ResponseFormat         = Field(default=ResponseFormat.MARKDOWN)
+
+
+class SprintUpdateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    sprint_id:  str                    = Field(..., description="Sprint UUID")
+    name:       Optional[str]          = Field(None, max_length=100)
+    goal:       Optional[str]          = Field(None, max_length=500)
+    status:     Optional[SprintStatus] = Field(None, description="Setting 'active' demotes any current active sprint in this project to 'planned'.")
+    start_date: Optional[str]          = Field(None)
+    end_date:   Optional[str]          = Field(None)
+
+
+class SprintBoardInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    project_id: str           = Field(..., description="Project UUID")
+    sprint_id:  Optional[str] = Field(None, description="Sprint UUID. Omit to show the active sprint. If no active sprint, returns backlog.")
+
+
+# --- Task Models ---
+
+class TaskCreateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    project_id:     str               = Field(..., description="Project UUID")
+    created_by:     str               = Field(..., description="Agent UUID creating this task")
+    title:          str               = Field(..., description="Task title", min_length=1, max_length=200)
+    description:    Optional[str]     = Field(None, description="Optional task description", max_length=2000)
+    status:         TaskStatus        = Field(default=TaskStatus.BACKLOG, description="Initial status. Default: 'backlog'.")
+    priority:       TaskPriority      = Field(default=TaskPriority.MEDIUM, description="'low' | 'medium' | 'high' | 'critical'")
+    assigned_to:    Optional[str]     = Field(None, description="Agent UUID to assign this task to")
+    sprint_id:      Optional[str]     = Field(None, description="Sprint UUID. Omit to place task in backlog.")
+    thread_id:      Optional[str]     = Field(None, description="Thread UUID linking to related discussion")
+    due_date:       Optional[str]     = Field(None, description="Optional due date (ISO format: YYYY-MM-DD)")
+    blocked_reason: Optional[str]     = Field(None, description="Required when status is 'blocked'.", max_length=500)
+
+
+class TaskGetInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    task_id:         str            = Field(..., description="Task UUID")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+class TaskListInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    project_id:      str                    = Field(..., description="Project UUID")
+    sprint_id:       Optional[str]          = Field(None, description="Filter to a specific sprint UUID, or pass 'backlog' to see only unassigned tasks. Omit for all tasks.")
+    status:          Optional[TaskStatus]   = Field(None, description="Filter by status")
+    assigned_to:     Optional[str]          = Field(None, description="Filter to tasks assigned to this agent UUID")
+    priority:        Optional[TaskPriority] = Field(None, description="Filter by priority")
+    limit:           int                    = Field(default=20, ge=1, le=100)
+    offset:          int                    = Field(default=0, ge=0)
+    response_format: ResponseFormat         = Field(default=ResponseFormat.MARKDOWN)
+
+
+class TaskUpdateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    task_id:        str                    = Field(..., description="Task UUID to update")
+    title:          Optional[str]          = Field(None, max_length=200)
+    description:    Optional[str]          = Field(None, max_length=2000)
+    status:         Optional[TaskStatus]   = Field(None, description="New status. If setting to 'blocked', blocked_reason is required.")
+    priority:       Optional[TaskPriority] = Field(None)
+    sprint_id:      Optional[str]          = Field(None, description="Move to a different sprint. Pass empty string '' to move to backlog.")
+    thread_id:      Optional[str]          = Field(None)
+    due_date:       Optional[str]          = Field(None)
+    blocked_reason: Optional[str]          = Field(None, description="Required when setting status to 'blocked'. Explain what is stuck and why.", max_length=500)
+
+
+class TaskAssignInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    task_id:  str           = Field(..., description="Task UUID")
+    agent_id: Optional[str] = Field(None, description="Agent UUID to assign to. Omit or pass null to unassign.")
+
+
+class TaskDeleteInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    task_id: str = Field(..., description="Task UUID to delete")
+
+
+# =============================================================================
+# V4 Models — Task Dependencies + Sprint Retrospective
+# =============================================================================
+
+class TaskAddDependencyInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    task_id:    str = Field(..., description="Task UUID that will be blocked (cannot start until depends_on is done)")
+    depends_on: str = Field(..., description="Task UUID that must be done first")
+    created_by: str = Field(..., description="Agent UUID adding this dependency")
+
+
+class TaskRemoveDependencyInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    task_id:    str = Field(..., description="Task UUID")
+    depends_on: str = Field(..., description="Task UUID to remove as a dependency")
+
+
+class SprintCloseInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    sprint_id:  str            = Field(..., description="Sprint UUID to close")
+    closed_by:  str            = Field(..., description="Agent UUID closing the sprint")
+    notes:      Optional[str]  = Field(None, description="Optional notes to include in the retrospective", max_length=2000)

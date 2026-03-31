@@ -4,6 +4,7 @@ MCP tools definition module.
 Provides 46 fastMCP tools exposed to the LLM agent.
 """
 import json
+import sqlite3
 import uuid
 from datetime import datetime, timezone, timedelta
 
@@ -29,6 +30,13 @@ from models import (
     SkillCreateGlobalInput, SkillGetGlobalInput, SkillListGlobalInput,
     SkillUpdateGlobalInput, SkillDeleteGlobalInput, SkillSearchInput,
     HelpInput, SearchContextInput, ResponseFormat, SearchIn, GLOBAL_SENTINEL,
+    # v3 — Sprint Board
+    SprintCreateInput, SprintListInput, SprintUpdateInput, SprintBoardInput,
+    TaskCreateInput, TaskGetInput, TaskListInput, TaskUpdateInput,
+    TaskAssignInput, TaskDeleteInput,
+    TaskStatus, TaskPriority, SprintStatus,
+    # v4 — Task Dependencies + Sprint Retrospective
+    TaskAddDependencyInput, TaskRemoveDependencyInput, SprintCloseInput,
 )
 
 
@@ -1276,7 +1284,33 @@ _HELP_INDEX = {
                 ("context_handoff_post",        "Post a structured end-of-session handoff note",                  "from_agent_id, project_id, summary, in_progress?, blockers?, next_steps?, thread_refs?"),
                 ("context_handoff_get",         "Get recent handoffs for a project — read before starting work",  "project_id, limit"),
                 ("context_handoff_acknowledge", "Acknowledge a handoff — signals you've taken over",              "handoff_id, agent_id"),
-                ("context_session_start",       "⭐ ONE-SHOT session briefing. Call this first every session.",   "agent_id, project_id?"),
+                ("context_session_start",       "⭐ ONE-SHOT session briefing (messages, presence, skills, sprint tasks). Call first.",   "agent_id, project_id?"),
+            ],
+        },
+    },
+    "sprints": {
+        "label": "Pillar 5 — Sprint Board (13 tools)",
+        "description": "Agile task tracking, sprints, and Kanban board visualization. Tasks can exist in the backlog or be assigned to a sprint.",
+        "session_tip": "Call context_sprint_board visually check the active sprint at any time.",
+        "groups": {
+            "Sprints": [
+                ("context_sprint_board",   "Returns markdown Kanban board of the active sprint or backlog", ""),
+                ("context_sprint_create",  "Create a new sprint. Set status='active' to make it the current sprint", "project_id, name, goal?, status?, start_date?, end_date?"),
+                ("context_sprint_list",    "List sprints with their task counts and status",             "project_id, status?, limit, offset"),
+                ("context_sprint_update",  "Update a sprint's details or status",                        "sprint_id, name?, goal?, status?, start_date?, end_date?"),
+                ("context_sprint_close",   "Close a sprint: auto-generates retrospective thread, pins summary, posts handoff", "sprint_id, closed_by, notes?"),
+            ],
+            "Tasks": [
+                ("context_task_create",    "Create a task in backlog or a sprint",                       "project_id, title, created_by, description?, status?, priority?, assigned_to?, sprint_id?, thread_id?"),
+                ("context_task_list",      "List tasks with flexible filtering",                         "project_id, sprint_id?, status?, assigned_to?, priority?, limit, offset"),
+                ("context_task_get",       "Get full task details with all names resolved",              "task_id"),
+                ("context_task_update",    "Update a task's status / assignment / sprint",               "task_id, title?, status?, sprint_id?, blocked_reason?"),
+                ("context_task_assign",    "Quickly assign or unassign a task",                          "task_id, agent_id?"),
+                ("context_task_delete",    "Permanently delete a task",                                  "task_id"),
+            ],
+            "Task Dependencies": [
+                ("context_task_add_dependency",    "Add a dependency: task_id is blocked until depends_on is done. Cycle detection is automatic.", "task_id, depends_on, created_by"),
+                ("context_task_remove_dependency", "Remove an existing dependency between two tasks",    "task_id, depends_on"),
             ],
         },
     },
@@ -1310,9 +1344,9 @@ _RECOMMENDED_FLOW = """
 )
 async def context_help(params: HelpInput, ctx: Context) -> str:
     """
-    Index of all 46 tools organized by pillar. Call this first in any new session
+    Index of all 58 tools organized by pillar. Call this first in any new session
     or whenever you're unsure which tool to use.
-    Filter by pillar name ('core', 'memory', 'skills', 'collaboration') or keyword
+    Filter by pillar name ('core', 'memory', 'skills', 'collaboration', 'sprints') or keyword
     to narrow results. Each tool entry shows: name, purpose, and key parameters.
     For full parameter details, check the tool's own input schema.
 
@@ -2356,6 +2390,23 @@ async def context_session_start(params: SessionStartInput, ctx: Context) -> str:
                     sections.append(f"{scope_tag} **{s['name']}** `[{s['skill_type']}]` v{s['version']} — {s['description']}")
                 sections.append("")
 
+        # 6. Sprint tasks — Option C (conditional, silent omission)
+        if params.project_id:
+            sprint_tasks, sprint_name = db.db_sprint_tasks_for_session(
+                conn, params.agent_id, params.project_id
+            )
+            if sprint_tasks:
+                _priority_label = {"low": "LOW", "medium": "MED", "high": "HIGH", "critical": "CRIT"}
+                sections.append(f"## 📋 Your Sprint Tasks ({len(sprint_tasks)} assigned) — {sprint_name}")
+                for t in sprint_tasks:
+                    status_tag = t["status"].upper().replace("_", " ")
+                    pri_tag    = _priority_label.get(t["priority"], t["priority"].upper())
+                    line = f"- [{status_tag}] {t['title']} [{pri_tag}]"
+                    if t["status"] == "blocked" and t.get("blocked_reason"):
+                        line += f' — "{t["blocked_reason"]}"'
+                    sections.append(line)
+                sections.append("")
+
         return "\n".join(sections)
     except Exception as e:
         return _error(str(e))
@@ -2459,5 +2510,682 @@ async def context_search(params: SearchContextInput, ctx: Context) -> str:
         if pagination["has_more"]:
             lines.append(f"*Use offset={pagination['next_offset']} for next page.*")
         return "\n".join(lines)
+    except Exception as e:
+        return _error(str(e))
+
+
+# =============================================================================
+# SPRINT BOARD TOOLS (v3)
+# =============================================================================
+
+_PRIORITY_LABEL = {"low": "[LOW]", "medium": "[MED]", "high": "[HIGH]", "critical": "[CRIT]"}
+
+
+def _sprint_to_md(sprint: dict) -> str:
+    tc = sprint.get("task_counts", {})
+    lines = [
+        f"**ID:** `{sprint['id']}`",
+        f"**Status:** {sprint['status']}",
+        f"**Goal:** {sprint.get('goal') or 'No goal set'}",
+        f"**Dates:** {sprint.get('start_date') or '?'} to {sprint.get('end_date') or '?'}",
+    ]
+    if tc:
+        lines.append(
+            f"**Tasks:** {tc.get('total', 0)} total | "
+            f"blocked={tc.get('blocked', 0)} | in_progress={tc.get('in_progress', 0)} | "
+            f"done={tc.get('done', 0)}"
+        )
+    lines.append(f"**Created:** {_fmt_ts(sprint['created_at'])}")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="context_sprint_create",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
+)
+async def context_sprint_create(params: SprintCreateInput, ctx: Context) -> str:
+    """
+    Create a sprint — an optional time-boxed container for tasks within a project.
+    Sprints are not required. Tasks can exist in the project backlog without a sprint.
+    Setting status='active' will automatically demote any currently active sprint
+    in this project to 'planned'. Only one sprint per project can be active at a time.
+    """
+    try:
+        conn = ctx.request_context.lifespan_context["db"]
+        project = db.db_get_project_by_id(conn, params.project_id)
+        if not project:
+            return _error(f"Project '{params.project_id}' not found.")
+        now    = _now()
+        sid    = str(uuid.uuid4())
+        status = params.status.value
+        if status == "active":
+            db.db_sprint_demote_active(conn, params.project_id, sid, now)
+        sprint = db.db_sprint_create(
+            conn, sid, params.project_id, params.name, params.goal,
+            status, params.start_date, params.end_date, now
+        )
+        return json.dumps(sprint, indent=2)
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool(
+    name="context_sprint_list",
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+async def context_sprint_list(params: SprintListInput, ctx: Context) -> str:
+    """
+    List sprints for a project. Returns sprint metadata including task counts per status.
+    Use status='active' to find the current sprint quickly.
+    """
+    try:
+        conn   = ctx.request_context.lifespan_context["db"]
+        status = params.status.value if params.status else None
+        sprints, total = db.db_sprint_list(conn, params.project_id, status, params.limit, params.offset)
+        pagination = _pagination_meta(total, len(sprints), params.offset, params.limit)
+
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps({"sprints": sprints, **pagination}, indent=2)
+
+        if not sprints:
+            return "No sprints found for this project."
+        lines = [f"## Sprints ({total} total)\n"]
+        for s in sprints:
+            lines.append(f"### {s['name']} `[{s['status'].upper()}]` `{s['id']}`")
+            lines.append(_sprint_to_md(s))
+            lines.append("")
+        start_i = params.offset + 1
+        end_i   = params.offset + len(sprints)
+        lines.append(f"*Showing {start_i}–{end_i} of {total}*")
+        if pagination["has_more"]:
+            lines.append(f"*Use offset={pagination['next_offset']} for next page.*")
+        return "\n".join(lines)
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool(
+    name="context_sprint_update",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
+)
+async def context_sprint_update(params: SprintUpdateInput, ctx: Context) -> str:
+    """
+    Update a sprint's name, goal, status, or dates.
+    Setting status='active' automatically demotes the current active sprint (if any)
+    to 'planned'. Setting status='completed' does not affect tasks — they retain
+    their current status and must be moved manually.
+    """
+    try:
+        conn   = ctx.request_context.lifespan_context["db"]
+        sprint = db.db_sprint_get_by_id(conn, params.sprint_id)
+        if not sprint:
+            return _error(f"Sprint '{params.sprint_id}' not found.")
+        now = _now()
+
+        fields: dict = {}
+        if params.name       is not None: fields["name"]       = params.name
+        if params.goal       is not None: fields["goal"]       = params.goal
+        if params.start_date is not None: fields["start_date"] = params.start_date
+        if params.end_date   is not None: fields["end_date"]   = params.end_date
+        if params.status     is not None:
+            fields["status"] = params.status.value
+            if params.status == SprintStatus.ACTIVE:
+                db.db_sprint_demote_active(conn, sprint["project_id"], params.sprint_id, now)
+
+        updated = db.db_sprint_update(conn, params.sprint_id, fields, now)
+        return json.dumps(updated, indent=2)
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool(
+    name="context_sprint_board",
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+async def context_sprint_board(params: SprintBoardInput, ctx: Context) -> str:
+    """
+    Returns a formatted board view of all tasks in a sprint, grouped by status column.
+    Omit sprint_id to automatically show the active sprint for the project.
+    If no sprint is active and no sprint_id is provided, returns the project backlog.
+    This is the primary tool for understanding current work state at a glance.
+    Always returns markdown.
+    """
+    try:
+        conn    = ctx.request_context.lifespan_context["db"]
+        project = db.db_get_project_by_id(conn, params.project_id)
+        if not project:
+            return _error(f"Project '{params.project_id}' not found.")
+
+        now = _now()
+        is_backlog_view = False
+        sprint = None
+
+        if params.sprint_id:
+            sprint = db.db_sprint_get_by_id(conn, params.sprint_id)
+            if not sprint:
+                return _error(f"Sprint '{params.sprint_id}' not found.")
+            tasks = db.db_sprint_board_tasks(conn, sprint["id"])
+        else:
+            sprint = db.db_sprint_get_active(conn, params.project_id)
+            if sprint:
+                tasks = db.db_sprint_board_tasks(conn, sprint["id"])
+            else:
+                is_backlog_view = True
+                tasks = db.db_backlog_tasks(conn, params.project_id)
+
+        grouped: dict[str, list] = {
+            "backlog": [], "todo": [], "in_progress": [],
+            "blocked": [], "review": [], "done": []
+        }
+        for t in tasks:
+            grouped.setdefault(t["status"], []).append(t)
+
+        done_count    = len(grouped.get("done", []))
+        blocked_count = len(grouped.get("blocked", []))
+
+        if is_backlog_view:
+            header = [
+                "# Sprint Board: Project Backlog",
+                f"**Project:** {project['name']}",
+                "**Status:** No active sprint — showing unassigned backlog tasks",
+                f"**Total Tasks:** {len(tasks)} | Done: {done_count} | Blocked: {blocked_count}",
+            ]
+        else:
+            dates = f"{sprint.get('start_date') or '?'} to {sprint.get('end_date') or '?'}"
+            header = [
+                f"# Sprint Board: {sprint['name']}",
+                f"**Project:** {project['name']}",
+                f"**Goal:** {sprint.get('goal') or 'No goal set'}",
+                f"**Status:** {sprint['status']}",
+                f"**Dates:** {dates}",
+                f"**Total Tasks:** {len(tasks)} | Done: {done_count} | Blocked: {blocked_count}",
+            ]
+
+        lines = header + ["", "---", ""]
+        status_order = ["backlog", "todo", "in_progress", "blocked", "review", "done"]
+        status_label = {
+            "backlog": "BACKLOG", "todo": "TODO", "in_progress": "IN PROGRESS",
+            "blocked": "BLOCKED", "review": "REVIEW", "done": "DONE"
+        }
+
+        for status_key in status_order:
+            bucket = grouped.get(status_key, [])
+            if not bucket:
+                continue
+            lines.append(f"## {status_label[status_key]} ({len(bucket)})")
+            for t in bucket:
+                assignee = t.get("assigned_to_name") or "unassigned"
+                pri      = _PRIORITY_LABEL.get(t["priority"], t["priority"])
+                lines.append(f"- {pri} {t['title']} — {assignee}")
+                if status_key == "blocked" and t.get("blocked_reason"):
+                    lines.append(f"  Reason: {t['blocked_reason']}")
+                # dependency chain annotations
+                deps = db.db_task_get_dependencies(conn, t["id"])
+                for dep in deps["waiting_on"]:
+                    if dep["status"] != "done":
+                        lines.append(f"  Waiting on: \"{dep['title']}\" [{dep['status'].upper()}]")
+                for dep in deps["blocks"]:
+                    if dep["status"] != "done":
+                        lines.append(f"  Blocks: \"{dep['title']}\" [{dep['status'].upper()}]")
+            lines.append("")
+
+        lines.append(f"---\n*Board generated at {_fmt_ts(now)}*")
+        return "\n".join(lines)
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool(
+    name="context_task_create",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
+)
+async def context_task_create(params: TaskCreateInput, ctx: Context) -> str:
+    """
+    Create a task. Tasks land in the project backlog by default (no sprint required).
+    Assign to a sprint via sprint_id. Link to a discussion thread via thread_id.
+    status defaults to 'backlog'. If setting status='blocked' on creation,
+    blocked_reason is required.
+    """
+    try:
+        conn = ctx.request_context.lifespan_context["db"]
+        if not db.db_get_project_by_id(conn, params.project_id):
+            return _error(f"Project '{params.project_id}' not found.")
+        if not db.db_get_agent_by_id(conn, params.created_by):
+            return _error(f"Agent '{params.created_by}' not found.")
+        if params.sprint_id:
+            sprint = db.db_sprint_get_by_id(conn, params.sprint_id)
+            if not sprint:
+                return _error(f"Sprint '{params.sprint_id}' not found.")
+            if sprint["project_id"] != params.project_id:
+                return _error("Sprint does not belong to the given project.")
+        if params.assigned_to and not db.db_get_agent_by_id(conn, params.assigned_to):
+            return _error(f"Agent '{params.assigned_to}' not found.")
+        if params.status == TaskStatus.BLOCKED and not params.blocked_reason:
+            return _error("blocked_reason is required when status is 'blocked'.")
+
+        now  = _now()
+        task = db.db_task_create(
+            conn, str(uuid.uuid4()), params.project_id, params.sprint_id,
+            params.title, params.description, params.status.value,
+            params.assigned_to, params.created_by, params.priority.value,
+            params.blocked_reason, params.thread_id, params.due_date, now
+        )
+        return json.dumps(task, indent=2)
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool(
+    name="context_task_get",
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+async def context_task_get(params: TaskGetInput, ctx: Context) -> str:
+    """
+    Retrieve a single task by UUID. Returns all fields with resolved agent names,
+    sprint name, and project name for full context.
+    """
+    try:
+        conn = ctx.request_context.lifespan_context["db"]
+        task = db.db_task_get_full(conn, params.task_id)
+        if not task:
+            return _error(f"Task '{params.task_id}' not found. Use context_task_list to browse tasks.")
+
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps(task, indent=2)
+
+        pri = _PRIORITY_LABEL.get(task["priority"], task["priority"])
+        lines = [
+            f"## {task['title']} {pri}",
+            f"**ID:** `{task['id']}`",
+            f"**Status:** {task['status']}",
+            f"**Project:** {task.get('project_name', task['project_id'])}",
+            f"**Sprint:** {task.get('sprint_name') or 'Backlog'}",
+            f"**Assigned to:** {task.get('assigned_to_name') or 'Unassigned'}",
+            f"**Created by:** {task.get('created_by_name', task['created_by'])}",
+            f"**Due:** {task.get('due_date') or 'No due date'}",
+            f"**Created:** {_fmt_ts(task['created_at'])}",
+            f"**Updated:** {_fmt_ts(task['updated_at'])}",
+        ]
+        if task.get("thread_title"):
+            lines.append(f"**Thread:** {task['thread_title']} `{task['thread_id']}`")
+        if task["status"] == "blocked" and task.get("blocked_reason"):
+            lines.append(f"**Blocked reason:** {task['blocked_reason']}")
+        if task.get("description"):
+            lines.append(f"\n### Description\n{task['description']}")
+        return "\n".join(lines)
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool(
+    name="context_task_list",
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+async def context_task_list(params: TaskListInput, ctx: Context) -> str:
+    """
+    List tasks for a project with optional filters.
+    Omit sprint_id to see all tasks including backlog.
+    Pass sprint_id='backlog' to see only tasks not assigned to any sprint.
+    Filter by assigned_to with your agent UUID to see your personal workload.
+    Results ordered by: priority (critical first), then created_at.
+    """
+    try:
+        conn     = ctx.request_context.lifespan_context["db"]
+        status   = params.status.value if params.status else None
+        priority = params.priority.value if params.priority else None
+
+        tasks, total = db.db_task_list(
+            conn, params.project_id, params.sprint_id,
+            status, params.assigned_to, priority,
+            params.limit, params.offset
+        )
+        pagination = _pagination_meta(total, len(tasks), params.offset, params.limit)
+
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps({"tasks": tasks, **pagination}, indent=2)
+
+        if not tasks:
+            return "No tasks found matching the given filters."
+
+        lines = [f"## Tasks ({total} total)\n"]
+        for t in tasks:
+            pri      = _PRIORITY_LABEL.get(t["priority"], t["priority"])
+            assignee = t.get("assigned_to_name") or "unassigned"
+            sprint_n = t.get("sprint_name", "Backlog")
+            lines.append(f"- {pri} **{t['title']}** `{t['status']}` — {assignee} [{sprint_n}] `{t['id']}`")
+            if t["status"] == "blocked" and t.get("blocked_reason"):
+                lines.append(f"  ⚠️ {t['blocked_reason']}")
+        start_i = params.offset + 1
+        end_i   = params.offset + len(tasks)
+        lines.append(f"\n*Showing {start_i}–{end_i} of {total}*")
+        if pagination["has_more"]:
+            lines.append(f"*Use offset={pagination['next_offset']} for next page.*")
+        return "\n".join(lines)
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool(
+    name="context_task_update",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
+)
+async def context_task_update(params: TaskUpdateInput, ctx: Context) -> str:
+    """
+    Update any field on a task. Partial update — only provided fields are changed.
+    Free-flow transitions: any status can move to any other status.
+    IMPORTANT: If setting status='blocked', blocked_reason is required.
+    If moving away from 'blocked' to any other status, blocked_reason is
+    automatically cleared.
+    To move a task to the backlog, pass sprint_id as an empty string.
+    """
+    try:
+        conn = ctx.request_context.lifespan_context["db"]
+        task = db.db_task_get_by_id(conn, params.task_id)
+        if not task:
+            return _error(f"Task '{params.task_id}' not found.")
+        now = _now()
+
+        if params.status == TaskStatus.BLOCKED:
+            if not params.blocked_reason and not task.get("blocked_reason"):
+                return _error("blocked_reason is required when setting status to 'blocked'.")
+
+        if params.status == TaskStatus.IN_PROGRESS:
+            blocking = conn.execute(
+                """SELECT t.id, t.title, t.status
+                   FROM task_dependencies td
+                   JOIN tasks t ON td.depends_on = t.id
+                   WHERE td.task_id = ? AND t.status != 'done'""",
+                (params.task_id,)
+            ).fetchall()
+            if blocking:
+                titles = ", ".join(f"'{r['title']}' ({r['status']})" for r in blocking)
+                return _error(
+                    f"Cannot move to in_progress: blocked by {len(blocking)} unfinished "
+                    f"task(s): {titles}. Complete those first or remove the dependencies."
+                )
+
+        fields: dict = {}
+        if params.title       is not None: fields["title"]       = params.title
+        if params.description is not None: fields["description"] = params.description
+        if params.priority    is not None: fields["priority"]    = params.priority.value
+        if params.thread_id   is not None: fields["thread_id"]   = params.thread_id
+        if params.due_date    is not None: fields["due_date"]    = params.due_date
+
+        if params.sprint_id is not None:
+            fields["sprint_id"] = None if params.sprint_id == "" else params.sprint_id
+
+        if params.status is not None:
+            new_status = params.status.value
+            fields["status"] = new_status
+            if task["status"] == "blocked" and new_status != "blocked":
+                fields["blocked_reason"] = None
+            elif new_status == "blocked" and params.blocked_reason:
+                fields["blocked_reason"] = params.blocked_reason
+        elif params.blocked_reason is not None:
+            fields["blocked_reason"] = params.blocked_reason
+
+        updated = db.db_task_update(conn, params.task_id, fields, now)
+        return json.dumps(updated, indent=2)
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool(
+    name="context_task_assign",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+async def context_task_assign(params: TaskAssignInput, ctx: Context) -> str:
+    """
+    Assign a task to an agent, or unassign it by omitting agent_id.
+    Dedicated tool for assignment — cleaner than calling context_task_update
+    just to change the assignee.
+    """
+    try:
+        conn = ctx.request_context.lifespan_context["db"]
+        task = db.db_task_get_by_id(conn, params.task_id)
+        if not task:
+            return _error(f"Task '{params.task_id}' not found.")
+        agent_name = None
+        if params.agent_id:
+            agent = db.db_get_agent_by_id(conn, params.agent_id)
+            if not agent:
+                return _error(f"Agent '{params.agent_id}' not found.")
+            agent_name = agent["name"]
+        db.db_task_assign(conn, params.task_id, params.agent_id, _now())
+        if agent_name:
+            return f"Task '{task['title']}' assigned to {agent_name}."
+        return f"Task '{task['title']}' unassigned."
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool(
+    name="context_task_delete",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False),
+)
+async def context_task_delete(params: TaskDeleteInput, ctx: Context) -> str:
+    """
+    Permanently delete a task. This cannot be undone.
+    Consider setting status='done' instead if you want to preserve history.
+    """
+    try:
+        conn  = ctx.request_context.lifespan_context["db"]
+        title = db.db_task_delete(conn, params.task_id)
+        if title is None:
+            return "Task not found — nothing deleted."
+        return f"Task '{title}' permanently deleted."
+    except Exception as e:
+        return _error(str(e))
+
+
+# =============================================================================
+# V4 Tools — Task Dependencies + Sprint Retrospective
+# =============================================================================
+
+@mcp.tool(
+    name="context_task_add_dependency",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+async def context_task_add_dependency(params: TaskAddDependencyInput, ctx: Context) -> str:
+    """
+    Add a dependency between two tasks. task_id will be blocked by depends_on —
+    meaning task_id cannot move to 'in_progress' while depends_on is not 'done'.
+    Circular dependencies are rejected automatically.
+    Idempotent: adding an existing dependency returns success silently.
+    Both tasks must belong to the same project.
+    """
+    try:
+        conn = ctx.request_context.lifespan_context["db"]
+
+        task       = db.db_task_get_full(conn, params.task_id)
+        dep_task   = db.db_task_get_full(conn, params.depends_on)
+
+        if not task:
+            return _error(f"Task '{params.task_id}' not found.")
+        if not dep_task:
+            return _error(f"Task '{params.depends_on}' not found.")
+        if task["project_id"] != dep_task["project_id"]:
+            return _error("Both tasks must belong to the same project.")
+        if params.task_id == params.depends_on:
+            return _error("A task cannot depend on itself.")
+        if not db.db_get_agent_by_id(conn, params.created_by):
+            return _error(f"Agent '{params.created_by}' not found.")
+
+        if db.would_create_cycle(conn, params.task_id, params.depends_on):
+            return _error("Cannot add dependency: would create a circular dependency chain.")
+
+        try:
+            db.db_task_add_dependency(conn, str(uuid.uuid4()), params.task_id, params.depends_on,
+                                      params.created_by, _now())
+        except sqlite3.IntegrityError:
+            pass  # already exists — idempotent
+
+        return f"Task '{task['title']}' now depends on '{dep_task['title']}'."
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool(
+    name="context_task_remove_dependency",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False),
+)
+async def context_task_remove_dependency(params: TaskRemoveDependencyInput, ctx: Context) -> str:
+    """
+    Remove a dependency between two tasks.
+    Idempotent: if the dependency does not exist, returns a 'not found' message without error.
+    """
+    try:
+        conn     = ctx.request_context.lifespan_context["db"]
+        task     = db.db_task_get_full(conn, params.task_id)
+        dep_task = db.db_task_get_full(conn, params.depends_on)
+
+        if not task:
+            return _error(f"Task '{params.task_id}' not found.")
+        if not dep_task:
+            return _error(f"Task '{params.depends_on}' not found.")
+
+        removed = db.db_task_remove_dependency(conn, params.task_id, params.depends_on)
+        if not removed:
+            return "Dependency not found — nothing removed."
+        return f"Dependency removed. Task '{task['title']}' no longer depends on '{dep_task['title']}'."
+    except Exception as e:
+        return _error(str(e))
+
+
+@mcp.tool(
+    name="context_sprint_close",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+async def context_sprint_close(params: SprintCloseInput, ctx: Context) -> str:
+    """
+    Close a sprint and automatically generate a structured retrospective.
+    Computes what shipped, what carried over, what got blocked and why,
+    which agents participated, and how long the sprint ran.
+    Posts the retrospective as a pinned 'decision' entry in a new dedicated thread.
+    Sets sprint status to 'completed'.
+    Also posts a handoff note so the next session picks up with full context.
+    Idempotent: if sprint is already completed, returns the existing retrospective thread link.
+    """
+    try:
+        conn = ctx.request_context.lifespan_context["db"]
+
+        sprint = db.db_sprint_get_by_id(conn, params.sprint_id)
+        if not sprint:
+            return _error(f"Sprint '{params.sprint_id}' not found.")
+
+        if sprint["status"] == "completed":
+            return f"Sprint '{sprint['name']}' is already closed."
+
+        agent = db.db_get_agent_by_id(conn, params.closed_by)
+        if not agent:
+            return _error(f"Agent '{params.closed_by}' not found.")
+
+        retro = db.db_sprint_retro_data(conn, params.sprint_id)
+        tasks_by_status = retro["tasks_by_status"]
+        project         = retro["project"]
+
+        done_tasks    = tasks_by_status.get("done", [])
+        blocked_tasks = tasks_by_status.get("blocked", [])
+        carried_over  = [t for t in retro["all_tasks"] if t["status"] != "done"]
+        agent_names   = [a["name"] for a in retro["agents"]] or ["(none)"]
+
+        now        = _now()
+        close_date = now[:10]
+        start_date = sprint.get("start_date") or sprint["created_at"][:10]
+        try:
+            from datetime import date
+            delta = (date.fromisoformat(close_date) - date.fromisoformat(start_date)).days
+            duration = f"{start_date} to {close_date} ({delta} day{'s' if delta != 1 else ''})"
+        except Exception:
+            duration = f"{start_date} to {close_date}"
+
+        def task_line(t):
+            name = t.get("assigned_to_name") or "unassigned"
+            return f"- {t['title']} — {name}"
+
+        retro_lines = [
+            f"# Sprint Retrospective: {sprint['name']}",
+            "",
+            f"**Project:** {project.get('name', '?')}",
+            f"**Closed by:** {agent['name']}",
+            f"**Duration:** {duration}",
+            f"**Goal:** {sprint.get('goal') or 'No goal set'}",
+            "",
+            "---",
+            "",
+            f"## What Shipped ({len(done_tasks)} tasks)",
+        ]
+        if done_tasks:
+            retro_lines += [task_line(t) for t in done_tasks]
+        else:
+            retro_lines.append("- (none)")
+
+        retro_lines += ["", f"## Carried Over ({len(carried_over)} tasks)"]
+        if carried_over:
+            for t in carried_over:
+                name = t.get("assigned_to_name") or "unassigned"
+                retro_lines.append(f"- {t['title']} [{t['status']}] — {name}")
+        else:
+            retro_lines.append("- (none)")
+
+        retro_lines += ["", f"## Blocked at Close ({len(blocked_tasks)} tasks)"]
+        if blocked_tasks:
+            for t in blocked_tasks:
+                name = t.get("assigned_to_name") or "unassigned"
+                retro_lines.append(f"- {t['title']} — {name}")
+                if t.get("blocked_reason"):
+                    retro_lines.append(f"  Reason: {t['blocked_reason']}")
+        else:
+            retro_lines.append("- (none)")
+
+        retro_lines += [
+            "",
+            "## Participants",
+            ", ".join(agent_names),
+            "",
+            "## Notes",
+            params.notes if params.notes else "No additional notes.",
+            "",
+            "---",
+            f"*Retrospective generated {_fmt_ts(now)} UTC by {agent['name']}*",
+        ]
+        retro_md = "\n".join(retro_lines)
+
+        # Create a dedicated retrospective thread and pin the entry
+        retro_thread_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO threads (id, project_id, title, status, created_at) VALUES (?, ?, ?, 'open', ?)",
+            (retro_thread_id, sprint["project_id"], f"{sprint['name']} — Retrospective", now)
+        )
+        entry_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO entries (id, thread_id, agent_id, type, content, pinned, created_at, updated_at) VALUES (?, ?, ?, 'decision', ?, 1, ?, ?)",
+            (entry_id, retro_thread_id, params.closed_by, retro_md, now, now)
+        )
+
+        # Mark sprint completed
+        conn.execute(
+            "UPDATE sprints SET status = 'completed', updated_at = ? WHERE id = ?",
+            (now, params.sprint_id)
+        )
+        conn.commit()
+
+        # Post handoff
+        carried_titles = ", ".join(t["title"] for t in carried_over) if carried_over else "none"
+        conn.execute(
+            """INSERT INTO handoffs
+               (id, from_agent_id, project_id, summary, in_progress, blockers, next_steps, thread_refs, acknowledged_by, acknowledged_at, created_at)
+               VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, ?)""",
+            (
+                str(uuid.uuid4()), params.closed_by, sprint["project_id"],
+                retro_md[:500],
+                f"Carry over: {carried_titles}",
+                json.dumps([retro_thread_id]),
+                now,
+            )
+        )
+        conn.commit()
+
+        return retro_md
     except Exception as e:
         return _error(str(e))

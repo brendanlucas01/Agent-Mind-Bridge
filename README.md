@@ -14,8 +14,9 @@ Agents can read and write to the same projects, threads, memory, and skills acro
 | **Memory** | 8 | Short-term (session state) + long-term (durable facts) per agent and project |
 | **Skills** | 11 | Personal agent procedures + global project standards |
 | **Collaboration** | 9 | Async messages, presence, structured handoffs, session briefings |
+| **Sprint Board** | 13 | Agile task tracking, sprints, Kanban board, task dependencies, sprint retrospectives |
 | **Help** | 1 | `context_help` — full tool index with usage guide |
-| **Total** | **46** | |
+| **Total** | **59** | |
 
 ---
 
@@ -23,19 +24,27 @@ Agents can read and write to the same projects, threads, memory, and skills acro
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/brendanlucas01/Agent-Mind-Bridge.git
-cd Agent-Mind-Bridge
+git clone <repo-url>
+cd mcp_communicator
 pip install -r requirements.txt
 
 # 2. Configure (optional)
 cp .env.example .env
-# Edit .env to change port or database path
+# Edit .env to change ports or database path
 
-# 3. Run
-python server.py
+# 3. Start everything
+./start.sh
 ```
 
-Server starts at `http://127.0.0.1:3333/mcp` by default.
+This starts three services:
+- **MCP Server** — `http://127.0.0.1:3333/mcp`
+- **REST API** — `http://127.0.0.1:8000`
+- **Dashboard** — `http://localhost:3000`
+
+To run the MCP server only (no dashboard):
+```bash
+python server.py
+```
 
 See [INSTALL.md](INSTALL.md) for full setup instructions including IDE integration.
 
@@ -47,8 +56,11 @@ See [INSTALL.md](INSTALL.md) for full setup instructions including IDE integrati
 server.py          Entry point — starts FastMCP with streamable-http transport
 app.py             FastMCP instance and lifespan (DB init)
 db.py              All SQLite queries — no logic, pure data access
-tools.py           All 46 MCP tool handlers — registered on the mcp instance
+tools.py           All 59 MCP tool handlers — registered on the mcp instance
 models.py          Pydantic input models and enums for all tools
+api.py             FastAPI REST server — 12 read-only endpoints for the dashboard
+dashboard/         Next.js web dashboard — sprint board, activity stream, handoffs
+start.sh           Single command to launch MCP server + REST API + dashboard
 ```
 
 **Database:** SQLite with WAL mode. Single file (`shared_context.db`). FTS5 full-text search on entries, threads, skills, and long-term memory.
@@ -63,20 +75,49 @@ models.py          Pydantic input models and enums for all tools
 ```bash
 claude mcp add --transport http shared-context http://127.0.0.1:3333/mcp
 ```
-Then restart Claude Code. All 46 tools appear automatically.
+Restart Claude Code. Run `/mcp` to verify the server appears with 59 tools.
 
-### Cursor / Windsurf
-Add to your MCP config file:
+### Cursor
+Config file: `~/.cursor/mcp.json`
 ```json
 {
   "mcpServers": {
     "shared-context": {
-      "type": "http",
       "url": "http://127.0.0.1:3333/mcp"
     }
   }
 }
 ```
+
+### Windsurf / Antigravity
+Config file: `~/.codeium/windsurf/mcp_config.json`
+```json
+{
+  "mcpServers": {
+    "shared-context": {
+      "serverUrl": "http://127.0.0.1:3333/mcp"
+    }
+  }
+}
+```
+> Note: Windsurf and Antigravity share the same MCP config format. `serverUrl` is the correct key — `url` will not work.
+
+### Cline / ROO / Kilo Code
+Config file: accessible via the extension's MCP settings panel in VS Code.
+```json
+{
+  "mcpServers": {
+    "shared-context": {
+      "type": "streamableHttp",
+      "url": "http://127.0.0.1:3333/mcp",
+      "disabled": false,
+      "timeout": 60
+    }
+  }
+}
+```
+
+See [INSTALL.md](INSTALL.md) for step-by-step connection instructions per IDE.
 
 ---
 
@@ -113,9 +154,10 @@ Agent A (Claude Code) and Agent B (Gemini) collaborating:
 
 ## Thinking Like a Human Team
 
-The easiest way to understand the 46 Shared Context tools is to think of the AI agent as a human employee working in a physical corporate office. Here is how the concepts map to the real world:
+The easiest way to understand the 59 Shared Context tools is to think of the AI agent as a human employee working in a physical corporate office. Here is how the concepts map to the real world:
 
 - **Projects & Threads**: Think of these as filing cabinets and active desk folders, or Slack channels and email chains.
+- **Tasks & Sprints**: The team's Kanban board where everyone picks up their assignments and tracks blockers.
 - **Short-Term Memory**: A sticky note right on your monitor. It keeps track of exactly what you are doing *right now*, to be thrown away when the task is done.
 - **Long-Term Memory**: The official company wiki where durable facts, project preferences, and long-standing knowledge are logged.
 - **Skills**: Standard Operating Procedures (SOPs) or personal checklists that ensure consistency across tasks.
@@ -132,9 +174,12 @@ All config is via `.env` (copy from `.env.example`):
 
 | Variable | Default | Description |
 |---|---|---|
-| `HOST` | `127.0.0.1` | Server bind host |
-| `PORT` | `3333` | Server port |
+| `HOST` | `127.0.0.1` | MCP server bind host |
+| `PORT` | `3333` | MCP server port |
 | `DB_PATH` | `shared_context.db` | SQLite database path |
+| `API_HOST` | `127.0.0.1` | REST API bind host |
+| `API_PORT` | `8000` | REST API port |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Dashboard → REST API URL |
 
 ---
 
